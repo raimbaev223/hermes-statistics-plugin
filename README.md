@@ -61,6 +61,7 @@ Then reload the app's plugin host: ⌘K / Ctrl-K → **Reload desktop plugins**
 or ⌘K → **Open Observability**.
 
 Uninstall: delete `desktop-plugins/observability/` and reload plugins.
+Update: `git -C "${HERMES_HOME:-$HOME/.hermes}/desktop-plugins/observability" pull` and reload plugins.
 
 The plugin must live in the *root* `desktop-plugins` directory — the desktop app
 loads plugins app-level, not per profile. The per-profile data it displays is
