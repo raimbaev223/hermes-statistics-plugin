@@ -51,7 +51,7 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'statistics'
@@ -66,6 +66,53 @@ const REFRESH_MS = 30_000
 // ─── data layer ──────────────────────────────────────────────────────────────
 
 const $home = atom(null)
+const $shellSession = atom(null)
+
+// The gateway's canonical dispatcher serves `shell.exec` through the session
+// authority: `{command}` alone comes back as `4001 invalid_params` — it wants
+// a `session_id` too (the command then runs in that session's launch cwd;
+// every path this plugin passes is absolute). Gateways older than the session
+// authority take no session at all, so the bare form is the last fallback.
+async function shellSessionIds() {
+  const ids = []
+  const cached = $shellSession.get()
+  if (cached) ids.push(cached)
+  try {
+    const focused = host.state.focusedSessionId ? host.state.focusedSessionId.get() : null
+    if (typeof focused === 'string' && focused) ids.push(focused)
+  } catch {
+    // host.state unavailable: fall through to the session list
+  }
+  if (!cached) {
+    try {
+      const res = await host.request('session.list', { limit: 1 }, 20_000)
+      const row = res && Array.isArray(res.sessions) ? res.sessions[0] : null
+      const sid = row && (row.session_id || row.id)
+      if (sid) ids.push(sid)
+    } catch {
+      // no session store reachable: the bare form below still gets a chance
+    }
+  }
+  ids.push(null)
+  return [...new Set(ids)]
+}
+
+async function shellExec(command, timeoutMs) {
+  const budget = timeoutMs || 120_000
+  let lastErr = null
+  for (const sid of await shellSessionIds()) {
+    try {
+      const params = sid ? { session_id: sid, command } : { command }
+      const res = await host.request('shell.exec', params, budget)
+      if (sid) $shellSession.set(sid)
+      return res
+    } catch (err) {
+      lastErr = err
+      $shellSession.set(null)
+    }
+  }
+  throw lastErr || new Error('shell.exec failed')
+}
 
 /** The gateway process's own HERMES_HOME. `hermes serve` runs with the hermes
  *  ROOT (multi-profile hosting), so the shell is the only honest source. */
@@ -75,7 +122,7 @@ async function resolveHome() {
 
   let home = null
   try {
-    const res = await host.request('shell.exec', { command: 'printf %s "$HERMES_HOME"' }, 20_000)
+    const res = await shellExec('printf %s "$HERMES_HOME"', 20_000)
     const out = (res && res.stdout ? res.stdout : '').trim()
     if (out && out.indexOf('/') === 0) home = out.replace(/\/+$/, '')
   } catch {
@@ -93,7 +140,7 @@ async function runCollector(args, timeoutMs) {
   const home = await resolveHome()
   if (!home) throw new Error('could not resolve the Hermes home (desktop bridge unavailable)')
   const cmd = ['python3', `${home}/${COLLECTOR_REL}`, ...args].map((a) => (/[\s"']/.test(a) ? JSON.stringify(a) : a)).join(' ')
-  const res = await host.request('shell.exec', { command: cmd }, timeoutMs || 120_000)
+  const res = await shellExec(cmd, timeoutMs || 120_000)
   if (!res || res.code !== 0) {
     throw new Error((res && res.stderr && res.stderr.trim()) || `collector exited with code ${res ? res.code : '?'}`)
   }
@@ -241,6 +288,359 @@ function TopConsumers({ consumers, metric }) {
           jsx(Bar, { fraction: (c[key] || 0) / max })
         ]
       }, c.agent))
+  })
+}
+
+// ─── charts (plain SVG, no chart library) ────────────────────────────────────
+
+// Series palette: the app's own hues, so the charts repaint with the theme.
+const SERIES_COLORS = [
+  'var(--ui-purple)',
+  'var(--ui-blue)',
+  'var(--ui-green)',
+  'var(--ui-orange)',
+  'var(--ui-cyan)',
+  'var(--ui-red)',
+  'var(--ui-accent)'
+]
+const OTHER_COLOR = 'var(--ui-text-quaternary)'
+
+const hourStamp = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}`
+
+const hourTime = (h) => Date.parse(`${String(h).slice(0, 13).replace(' ', 'T')}:00:00`)
+
+/**
+ * The log parser only emits hours that had calls, so a raw series jumps 18:00 →
+ * 21:00 with no marker. On a line chart that reads as three flat hours, so the
+ * window is rebuilt hour by hour and the holes become real zero buckets.
+ */
+function densifyHours(rows, cap) {
+  if (rows.length < 2) return rows
+  const step = 3600 * 1000
+  const first = hourTime(rows[0].hour)
+  const last = hourTime(rows[rows.length - 1].hour)
+  if (!Number.isFinite(first) || !Number.isFinite(last) || last <= first) return rows
+  const span = Math.round((last - first) / step) + 1
+  if (span <= rows.length || span > (cap || 240)) return rows
+  const byHour = new Map(rows.map((r) => [hourTime(r.hour), r]))
+  const out = []
+  for (let t = first; t <= last; t += step) {
+    out.push(byHour.get(t) || { avg_latency: 0, gap: true, hour: hourStamp(new Date(t)), in: 0, llm: 0, out: 0 })
+  }
+  return out
+}
+
+/** Top `max` rows by value, the rest folded into one `other` slice. */
+function topSegments(rows, max) {
+  const live = rows.filter((r) => (r.value || 0) > 0).sort((a, b) => b.value - a.value)
+  const limit = max || 6
+  if (live.length <= limit) return live.map((r, i) => ({ ...r, color: r.color || SERIES_COLORS[i % SERIES_COLORS.length] }))
+  const head = live.slice(0, limit - 1)
+  const rest = live.slice(limit - 1).reduce((a, r) => a + r.value, 0)
+  return [
+    ...head.map((r, i) => ({ ...r, color: r.color || SERIES_COLORS[i % SERIES_COLORS.length] })),
+    { label: 'other', value: rest, color: OTHER_COLOR }
+  ]
+}
+
+function ChartCard({ children, hint, title }) {
+  return jsxs('div', {
+    className: 'flex min-w-0 flex-col gap-2 rounded-md border border-(--ui-stroke-secondary) px-2.5 py-2',
+    children: [
+      jsx(Tip, {
+        label: hint || title,
+        children: jsx('div', {
+          className: 'text-[0.6rem] font-medium uppercase tracking-wider text-muted-foreground/55',
+          children: title
+        })
+      }),
+      children
+    ]
+  })
+}
+
+/**
+ * Donut. Arcs are drawn as dashed strokes on one circle, so no arc maths and no
+ * chart library. In-slice labels are white with a dark halo: the only way to
+ * stay readable over an arbitrary series colour in both the light and dark
+ * theme, where a single theme text token would flip contrast on half the ring.
+ */
+function Donut({ centerLabel, centerValue, labelMode, segments }) {
+  const total = segments.reduce((a, s) => a + (s.value || 0), 0)
+  if (!total) {
+    return jsx('p', { className: 'text-[0.7rem] text-muted-foreground/55', children: 'No recorded activity.' })
+  }
+
+  const R = 62
+  const SW = 26
+  const C = 2 * Math.PI * R
+  const GAP = segments.length > 1 ? 2.5 : 0
+  let acc = 0
+  const arcs = []
+  const labels = []
+
+  for (const s of segments) {
+    const frac = (s.value || 0) / total
+    const len = Math.max(0, frac * C - GAP)
+    arcs.push(jsx('circle', {
+      cx: 80,
+      cy: 80,
+      fill: 'none',
+      r: R,
+      stroke: s.color,
+      strokeDasharray: `${len} ${C - len}`,
+      strokeDashoffset: -acc,
+      strokeWidth: SW,
+      transform: 'rotate(-90 80 80)',
+      children: jsx('title', { children: `${s.label}: ${exact(s.value)} · ${pct(frac * 100)}` })
+    }, `arc-${s.label}`))
+
+    // Below ~7% (or ~10% for the wider token labels) the text would spill over
+    // the neighbouring arc, so the legend carries those values instead.
+    const minFrac = labelMode === 'value' ? 0.1 : 0.07
+    if (frac >= minFrac) {
+      const mid = ((acc + (frac * C) / 2) / C) * 2 * Math.PI - Math.PI / 2
+      labels.push(jsx('text', {
+        dominantBaseline: 'central',
+        fill: '#fff',
+        style: {
+          fontSize: 11,
+          fontWeight: 600,
+          paintOrder: 'stroke',
+          stroke: 'rgba(0,0,0,0.4)',
+          strokeLinejoin: 'round',
+          strokeWidth: 2.6
+        },
+        textAnchor: 'middle',
+        x: 80 + Math.cos(mid) * R,
+        y: 80 + Math.sin(mid) * R,
+        children: labelMode === 'value' ? compact(s.value) : pct(frac * 100)
+      }, `label-${s.label}`))
+    }
+    acc += frac * C
+  }
+
+  return jsxs('div', {
+    className: 'flex min-w-0 items-center gap-3',
+    children: [
+      jsxs('svg', {
+        className: 'shrink-0',
+        style: { height: 148, width: 148 },
+        viewBox: '0 0 160 160',
+        children: [
+          jsx('circle', {
+            cx: 80,
+            cy: 80,
+            fill: 'none',
+            opacity: 0.3,
+            r: R,
+            stroke: 'var(--ui-bg-tertiary)',
+            strokeWidth: SW
+          }),
+          ...arcs,
+          ...labels,
+          centerValue
+            ? jsx('text', {
+                style: { fill: 'var(--ui-text-primary)', fontSize: 13, fontWeight: 600 },
+                textAnchor: 'middle',
+                x: 80,
+                y: 77,
+                children: centerValue
+              })
+            : null,
+          centerLabel
+            ? jsx('text', {
+                style: { fill: 'var(--ui-text-quaternary)', fontSize: 7.5, letterSpacing: '0.08em' },
+                textAnchor: 'middle',
+                x: 80,
+                y: 91,
+                children: String(centerLabel).toUpperCase()
+              })
+            : null
+        ]
+      }),
+      jsx('div', {
+        className: 'flex min-w-0 flex-1 flex-col gap-1',
+        style: { maxWidth: 240 },
+        children: segments.map((s) =>
+          jsxs('div', {
+            className: 'flex min-w-0 items-center gap-1.5 text-[0.66rem]',
+            children: [
+              jsx('span', {
+                className: 'size-2 shrink-0 rounded-[2px]',
+                style: { background: s.color }
+              }),
+              jsx('span', { className: 'min-w-0 flex-1 truncate text-muted-foreground/80', children: s.label }),
+              jsx('span', { className: 'shrink-0 tabular-nums text-foreground/85', children: exact(s.value) }),
+              jsx('span', {
+                className: 'w-9 shrink-0 text-right tabular-nums text-muted-foreground/50',
+                children: pct(((s.value || 0) / total) * 100)
+              })
+            ]
+          }, s.label)
+        )
+      })
+    ]
+  })
+}
+
+/** Live pixel width of a node — SVG is laid out 1:1 so labels never stretch. */
+function useMeasuredWidth(fallback) {
+  const ref = useRef(null)
+  const [width, setWidth] = useState(0)
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return undefined
+    const read = () => setWidth(Math.round(el.getBoundingClientRect().width) || 0)
+    read()
+    if (typeof ResizeObserver === 'undefined') return undefined
+    const ro = new ResizeObserver(read)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return [ref, width || fallback]
+}
+
+/**
+ * Multi-series line chart: thin strokes, a dot per point, dashed-free grid and
+ * an axis label per ~6 buckets — the reading order is legend, shape, table.
+ */
+function LineChart({ formatY, labels, series, titles }) {
+  const H = 148
+  const P = { b: 18, l: 40, r: 10, t: 8 }
+  const [ref, W] = useMeasuredWidth(560)
+  const n = labels.length
+  const max = Math.max(1, ...series.flatMap((s) => s.values.map((v) => v || 0)))
+  const x = (i) => (n <= 1 ? P.l + (W - P.l - P.r) / 2 : P.l + (i / (n - 1)) * (W - P.l - P.r))
+  const y = (v) => P.t + (1 - (v || 0) / max) * (H - P.t - P.b)
+  const fmt = formatY || compact
+  const titleAt = (i) => (titles && titles[i]) || labels[i]
+
+  const ticks = [0, 0.25, 0.5, 0.75, 1]
+  const every = Math.max(1, Math.ceil(n / 6))
+
+  return jsxs('div', {
+    className: 'flex min-w-0 flex-col gap-1.5',
+    children: [
+      jsxs('div', {
+        className: 'flex flex-wrap items-center gap-3 text-[0.62rem] text-muted-foreground/70',
+        children: series.map((s) =>
+          jsxs('div', {
+            className: 'flex items-center gap-1.5',
+            children: [
+              jsx('span', { className: 'h-px w-4', style: { background: s.color } }),
+              jsx('span', { children: s.label })
+            ]
+          }, s.label)
+        )
+      }),
+      jsx('div', {
+        className: 'w-full',
+        ref,
+        children: jsx('svg', {
+          className: 'block w-full',
+          height: H,
+          viewBox: `0 0 ${W} ${H}`,
+          width: W,
+          children: [
+          ...ticks.map((t) =>
+            jsxs('g', {
+              children: [
+                jsx('line', {
+                  stroke: 'var(--ui-stroke-secondary)',
+                  strokeWidth: 1,
+                  x1: P.l,
+                  x2: W - P.r,
+                  y1: y(max * t),
+                  y2: y(max * t)
+                }),
+                jsx('text', {
+                  className: 'text-[9px]',
+                  style: { fill: 'var(--ui-text-quaternary)' },
+                  textAnchor: 'end',
+                  x: P.l - 5,
+                  y: y(max * t) + 3,
+                  children: fmt(max * t)
+                })
+              ]
+            }, `tick-${t}`)
+          ),
+          ...labels.map((label, i) =>
+            i % every === 0 || i === n - 1
+              ? jsx('text', {
+                  className: 'text-[9px]',
+                  style: { fill: 'var(--ui-text-quaternary)' },
+                  textAnchor: i === n - 1 ? 'end' : 'middle',
+                  x: x(i),
+                  y: H - 5,
+                  children: label
+                }, `x-${label}-${i}`)
+              : null
+          ),
+          ...series.map((s) =>
+            jsxs('g', {
+              children: [
+                jsx('path', {
+                  d: s.values.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' '),
+                  fill: 'none',
+                  stroke: s.color,
+                  strokeLinejoin: 'round',
+                  strokeWidth: 1.6
+                }),
+                ...s.values.map((v, i) =>
+                  jsx('circle', {
+                    cx: x(i),
+                    cy: y(v),
+                    fill: s.color,
+                    r: 2.3,
+                    children: jsx('title', { children: `${titleAt(i)} — ${s.label}: ${exact(v)}` })
+                  }, `pt-${s.label}-${i}`)
+                )
+              ]
+            }, `series-${s.label}`)
+          )
+          ]
+        })
+      })
+    ]
+  })
+}
+
+/** One horizontal 100% bar plus a legend — composition at a glance. */
+function StackedBar({ segments }) {
+  const total = segments.reduce((a, s) => a + (s.value || 0), 0)
+  if (!total) {
+    return jsx('p', { className: 'text-[0.7rem] text-muted-foreground/55', children: 'No tokens recorded.' })
+  }
+  return jsxs('div', {
+    className: 'flex flex-col gap-2 py-1',
+    children: [
+      jsx('div', {
+        className: 'flex h-2.5 w-full overflow-hidden rounded-full bg-(--ui-bg-tertiary)',
+        children: segments.map((s) =>
+          jsx('div', {
+            className: 'h-full',
+            style: { background: s.color, width: `${((s.value || 0) / total) * 100}%` },
+            title: `${s.label}: ${exact(s.value)} · ${pct(((s.value || 0) / total) * 100)}`
+          }, s.label)
+        )
+      }),
+      jsxs('div', {
+        className: 'flex flex-wrap gap-x-4 gap-y-1',
+        children: segments.map((s) =>
+          jsxs('div', {
+            className: 'flex items-center gap-1.5 text-[0.66rem]',
+            children: [
+              jsx('span', { className: 'size-2 shrink-0 rounded-[2px]', style: { background: s.color } }),
+              jsx('span', { className: 'text-muted-foreground/80', children: s.label }),
+              jsx('span', { className: 'tabular-nums text-foreground/85', children: compact(s.value) }),
+              jsx('span', { className: 'tabular-nums text-muted-foreground/50', children: pct(((s.value || 0) / total) * 100) })
+            ]
+          }, s.label)
+        )
+      })
+    ]
   })
 }
 
@@ -874,9 +1274,22 @@ function UsageTab({ snap }) {
 
 function ActivityTab({ snap }) {
   const [period, setPeriod] = useState('24')
-  const series = snap.timeline.slice(-Number(period))
+  // The selector is a TIME window anchored on the newest bucket (not a slice of
+  // the last N buckets: the log parser skips empty hours, so 24 buckets can span
+  // three weeks). 'all' keeps everything the retained logs hold.
+  const all = snap.timeline
+  const newest = all.length ? hourTime(all[all.length - 1].hour) : NaN
+  const windowHours = Number(period)
+  const sparse =
+    period === '200' || !Number.isFinite(newest)
+      ? all
+      : all.filter((b) => {
+          const t = hourTime(b.hour)
+          return Number.isFinite(t) && t <= newest && newest - t <= (windowHours - 1) * 3600 * 1000 + 1
+        })
+  const series = densifyHours(sparse, windowHours + 2)
 
-  if (!series.length) {
+  if (!sparse.length) {
     return jsx(PanelEmpty, {
       description: 'The hourly series is parsed from API-call lines in each profile\'s logs/agent.log; the retained window holds none.',
       icon: 'pulse',
@@ -884,10 +1297,19 @@ function ActivityTab({ snap }) {
     })
   }
 
-  const max = Math.max(1, ...series.map((b) => b.llm))
+  const totals = snap.totals || {}
+  const consumers = snap.consumers || []
+
+  const requestSegments = topSegments(consumers.map((c) => ({ label: c.agent, value: c.llm_calls || 0 })))
+  const tokenSegments = topSegments(consumers.map((c) => ({ label: c.agent, value: (c.input || 0) + (c.output || 0) })))
+  const requestTotal = requestSegments.reduce((a, s) => a + s.value, 0)
+  const tokenTotal = tokenSegments.reduce((a, s) => a + s.value, 0)
+
+  const labels = series.map((b) => `${b.hour.slice(-2)}:00`)
+  const titles = series.map((b) => `${b.hour}:00`)
 
   return jsxs('div', {
-    className: 'flex min-h-0 flex-1 flex-col gap-4',
+    className: 'flex min-h-0 flex-1 flex-col gap-3',
     children: [
       jsxs('div', {
         className: 'flex flex-wrap items-center gap-2',
@@ -904,46 +1326,96 @@ function ActivityTab({ snap }) {
           }),
           jsx('span', {
             className: 'text-[0.65rem] text-muted-foreground/50',
-            children: `${series.length} hourly buckets · ${exact(series.reduce((a, b) => a + b.llm, 0))} logged calls`
+            children: `${sparse.length} hourly buckets · ${exact(sparse.reduce((a, b) => a + b.llm, 0))} logged calls`
           }, 'agents'),
         ]
       }),
       jsx('div', {
-        className: 'flex h-40 shrink-0 items-end gap-px overflow-hidden rounded border border-(--ui-stroke-secondary) p-2',
-        children: series.map((b) =>
-          jsx(Tip, {
-            label: `${b.hour}:00 — ${exact(b.llm)} calls, ${exact(b.in)} in / ${exact(b.out)} out, avg ${b.avg_latency}s`,
-            children: jsx('div', {
-              className: cn('min-w-[3px] flex-1 rounded-t bg-primary/60', b.llm === max && 'bg-primary'),
-              style: { height: `${Math.max(2, (b.llm / max) * 100)}%` }
-            })
-          }, b.hour))
-      }),
-      jsx('div', {
-        className: 'min-h-0 flex-1 overflow-y-auto',
-        children: jsxs('table', {
-          className: 'w-full border-collapse text-[0.68rem]',
+        className: 'min-h-0 flex-1 overflow-y-auto pr-1',
+        children: jsxs('div', {
+          className: 'flex flex-col gap-3',
           children: [
-            jsx(THead, { cols: [['Hour'], ['LLM calls', 'right'], ['Input tok', 'right'], ['Output tok', 'right'], ['Avg latency', 'right']] }),
-            jsx('tbody', {
-              children: series.slice().reverse().slice(0, 40).map((b) =>
-                jsxs('tr', {
-                  className: 'border-t border-(--ui-stroke-secondary)/40',
-                  children: [
-                    jsx(Td, { className: 'text-muted-foreground/80', children: b.hour }),
-                    jsx(Td, { align: 'right', children: exact(b.llm) }),
-                    jsx(Td, { align: 'right', children: exact(b.in) }),
-                    jsx(Td, { align: 'right', children: exact(b.out) }),
-                    jsx(Td, { align: 'right', className: 'text-muted-foreground/70', children: `${b.avg_latency}s` })
-                  ]
-                }, b.hour))
+            jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: [
+                jsx(ChartCard, {
+                  hint: 'Share of every LLM request each profile made, over the whole snapshot.',
+                  title: 'LLM requests by agent',
+                  children: jsx(Donut, {
+                    centerLabel: 'requests',
+                    centerValue: compact(requestTotal),
+                    segments: requestSegments
+                  })
+                }),
+                jsx(ChartCard, {
+                  hint: 'Input + output tokens per profile. Cache reads are shown apart — they are re-sent context, not fresh work.',
+                  title: 'Tokens by agent',
+                  children: jsx(Donut, {
+                    centerLabel: 'tokens',
+                    centerValue: compact(tokenTotal),
+                    labelMode: 'value',
+                    segments: tokenSegments
+                  })
+                })
+              ]
+            }),
+            jsx(ChartCard, {
+              hint: 'API-call lines per hour from the profile logs — the same series as the table below.',
+              title: 'LLM calls per hour',
+              children: jsx(LineChart, {
+                labels,
+                series: [{ color: SERIES_COLORS[1], label: 'LLM calls', values: series.map((b) => b.llm) }],
+                titles
+              })
+            }),
+            jsx(ChartCard, {
+              hint: 'Tokens sent in (prompt) and written out (completion) per hour, from the same log lines.',
+              title: 'Tokens per hour',
+              children: jsx(LineChart, {
+                labels,
+                series: [
+                  { color: SERIES_COLORS[1], label: 'input', values: series.map((b) => b.in) },
+                  { color: SERIES_COLORS[2], label: 'output', values: series.map((b) => b.out) }
+                ],
+                titles
+              })
+            }),
+            jsx(ChartCard, {
+              hint: 'All-time token mix. Cache reads dominate because every turn re-sends the cached prompt prefix.',
+              title: 'Token mix — cache read / input / output',
+              children: jsx(StackedBar, {
+                segments: [
+                  { color: SERIES_COLORS[0], label: 'cache read', value: totals.cache_read || 0 },
+                  { color: SERIES_COLORS[1], label: 'input', value: totals.input || 0 },
+                  { color: SERIES_COLORS[2], label: 'output', value: totals.output || 0 }
+                ]
+              })
+            }),
+            jsxs('table', {
+              className: 'w-full border-collapse text-[0.68rem]',
+              children: [
+                jsx(THead, { cols: [['Hour'], ['LLM calls', 'right'], ['Input tok', 'right'], ['Output tok', 'right'], ['Avg latency', 'right']] }),
+                jsx('tbody', {
+                  children: sparse.slice().reverse().slice(0, 40).map((b) =>
+                    jsxs('tr', {
+                      className: 'border-t border-(--ui-stroke-secondary)/40',
+                      children: [
+                        jsx(Td, { className: 'text-muted-foreground/80', children: b.hour }),
+                        jsx(Td, { align: 'right', children: exact(b.llm) }),
+                        jsx(Td, { align: 'right', children: exact(b.in) }),
+                        jsx(Td, { align: 'right', children: exact(b.out) }),
+                        jsx(Td, { align: 'right', className: 'text-muted-foreground/70', children: `${b.avg_latency}s` })
+                      ]
+                    }, b.hour))
+                })
+              ]
+            }),
+            jsx('p', {
+              className: 'text-[0.62rem] text-muted-foreground/50',
+              children: 'Buckets count every "API call #n" line found in the profile logs — the only per-request record Hermes keeps. It stops at the log rotation point, so "all" is as deep as the retained files go. The two donuts cover the whole snapshot; the line charts and the table follow the period switch. The lines are zero-filled per hour inside the selected window; the table lists only the hours the logs actually have.'
             })
           ]
         })
-      }),
-      jsx('p', {
-        className: 'text-[0.62rem] text-muted-foreground/50',
-        children: 'Buckets count every "API call #n" line found in the profile logs — the only per-request record Hermes keeps. It stops at the log rotation point, so "all" is as deep as the retained files go.'
       })
     ]
   })
