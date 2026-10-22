@@ -1,11 +1,11 @@
 /**
- * Observability — a Hermes desktop plugin answering "what is Hermes doing right
+ * Statistics — a Hermes desktop plugin answering "what is Hermes doing right
  * now, and where does all that work go?"
  *
  * Architecture (no new server, no new telemetry store):
  *   this UI (renderer realm)
  *     -> host.request('shell.exec', { command })        the app's own gateway RPC
- *        -> python3 <hermes home>/desktop-plugins/observability/collect.py
+ *        -> python3 <hermes home>/desktop-plugins/statistics/collect.py
  *           -> <home>/state.db                          sessions + messages
  *           -> <home>/kanban/boards/<slug>/kanban.db    tasks, runs, events
  *           -> <home>/logs/agent.log + errors.log       per-call lines, retries
@@ -54,10 +54,10 @@ import {
 import { useMemo, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
-const ID = 'observability'
-const SNAPSHOT_REL = 'plugin-data/observability/snapshot.json'
-const TRACE_REL = 'plugin-data/observability/trace'
-const COLLECTOR_REL = 'desktop-plugins/observability/collect.py'
+const ID = 'statistics'
+const SNAPSHOT_REL = 'plugin-data/statistics/snapshot.json'
+const TRACE_REL = 'plugin-data/statistics/trace'
+const COLLECTOR_REL = 'desktop-plugins/statistics/collect.py'
 // The collector stat()s 9 state.db files and tails logs, so it is not a cheap
 // poll; the page (and the statusbar chip, deduped onto the same query) refreshes
 // on this cadence while visible.
@@ -125,7 +125,7 @@ function useSnapshot(enabled) {
   return useQuery({
     enabled: enabled !== false,
     queryFn: fetchSnapshot,
-    queryKey: ['observability', 'snapshot'],
+    queryKey: ['statistics', 'snapshot'],
     refetchInterval: enabled === false ? false : REFRESH_MS,
     retry: 0,
     staleTime: 5_000
@@ -136,7 +136,7 @@ function useTrace(taskId) {
   return useQuery({
     enabled: Boolean(taskId),
     queryFn: () => fetchTrace(taskId),
-    queryKey: ['observability', 'trace', taskId],
+    queryKey: ['statistics', 'trace', taskId],
     retry: 0
   })
 }
@@ -951,7 +951,7 @@ function ActivityTab({ snap }) {
 
 // ─── page ────────────────────────────────────────────────────────────────────
 
-function ObservabilityPage() {
+function StatisticsPage() {
   const { data: snap, error, isFetching, isLoading, refetch } = useSnapshot(true)
   const [tab, setTab] = useState('overview')
   const [agent, setAgent] = useState(null)
@@ -977,7 +977,7 @@ function ObservabilityPage() {
       className: 'p-6',
       children: jsx(ErrorState, {
         description: `${error.message} — the collector runs through the gateway's shell.exec RPC and reads state.db, kanban.db and the profile logs.`,
-        title: 'Observability could not collect data'
+        title: 'Statistics could not collect data'
       })
     })
   }
@@ -1043,7 +1043,7 @@ function ObservabilityPage() {
 
 // ─── statusbar chip (shared query => no second collector run) ────────────────
 
-function ObservabilityChip() {
+function StatisticsChip() {
   const { data: snap } = useSnapshot(true)
   const gateway = useValue(host.state.gateway)
   if (!snap) return null
@@ -1052,7 +1052,7 @@ function ObservabilityChip() {
     label: `${exact(snap.totals.llm_calls)} LLM requests · ${exact(snap.totals.tool_calls)} tool calls · ${exact(errors)} errors · gateway ${gateway}`,
     children: jsxs('button', {
       className: 'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] tabular-nums text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
-      onClick: () => host.navigate('/observability'),
+      onClick: () => host.navigate('/statistics'),
       type: 'button',
       children: [
         jsx(Codicon, { name: 'pulse', size: '0.7rem' }),
@@ -1067,12 +1067,12 @@ function ObservabilityChip() {
 
 export default {
   id: ID,
-  name: 'Observability',
+  name: 'Statistics',
   description: 'Fleet dashboard: agents, LLM requests, tool calls, tasks, execution traces, errors and retries — read from Hermes\' own stores.',
   register(ctx) {
     ctx.i18n.register({
-      en: { nav: 'Observability', open: 'Open Observability' },
-      ru: { nav: 'Наблюдаемость', open: 'Открыть наблюдаемость' }
+      en: { nav: 'Statistics', open: 'Open Statistics' },
+      ru: { nav: 'Статистика', open: 'Открыть статистику' }
     })
 
     const register = () =>
@@ -1080,29 +1080,29 @@ export default {
         {
           id: 'page',
           area: ROUTES_AREA,
-          data: { path: '/observability' },
-          render: () => jsx(ObservabilityPage, {})
+          data: { path: '/statistics' },
+          render: () => jsx(StatisticsPage, {})
         },
         {
           id: 'nav',
           area: SIDEBAR_NAV_AREA,
           order: 60,
-          data: { codicon: 'pulse', label: ctx.i18n.t('nav'), path: '/observability' }
+          data: { codicon: 'pulse', label: ctx.i18n.t('nav'), path: '/statistics' }
         },
         {
           id: 'chip',
           area: STATUSBAR_AREAS.right,
           order: 70,
-          render: () => jsx(ObservabilityChip, {})
+          render: () => jsx(StatisticsChip, {})
         },
         {
           id: 'open',
           area: PALETTE_AREA,
           data: {
-            id: 'observability.open',
-            keywords: ['observability', 'telemetry', 'usage', 'tokens', 'agents', 'traces'],
+            id: 'statistics.open',
+            keywords: ['statistics', 'observability', 'telemetry', 'usage', 'tokens', 'agents', 'traces'],
             label: ctx.i18n.t('open'),
-            run: () => host.navigate('/observability')
+            run: () => host.navigate('/statistics')
           }
         }
       ])

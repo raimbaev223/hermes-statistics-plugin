@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Observability collector for Hermes — reads real data, writes one JSON snapshot.
+"""Statistics collector for Hermes — reads real data, writes one JSON snapshot.
 
 Read-only by construction: every sqlite handle is opened with mode=ro.
-No writes outside the snapshot dir. Invoked by the Observability desktop plugin
+No writes outside the snapshot dir. Invoked by the Statistics desktop plugin
 via shell.exec (argv form: `python3 <this> [--mode summary|trace --task ID]`).
 
 Data sources (all pre-existing, no Hermes changes):
@@ -21,8 +21,8 @@ import sqlite3
 import time
 from pathlib import Path
 
-HERMES_ROOT = Path(os.environ.get("HERMES_OBS_ROOT", str(Path.home() / ".hermes")))
-OUT_DIR = HERMES_ROOT / "plugin-data" / "observability"
+HERMES_ROOT = Path(os.environ.get("HERMES_STATS_ROOT", str(Path.home() / ".hermes")))
+OUT_DIR = HERMES_ROOT / "plugin-data" / "statistics"
 
 MAX_SESSIONS_PER_PROFILE = 300
 MAX_TASKS = 400
