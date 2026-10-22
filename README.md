@@ -40,7 +40,7 @@ host.request('shell.exec')  ──►  python3 collect.py
 | **Tasks** | Kanban tasks across every board on disk, with the usage of the worker session that ran them (LLM calls, tools, tokens), run count, wall-clock duration, last finish. Filter by text, status, agent, or "only tasks with usage". |
 | **Execution trace** | Click a task → the interleaved LLM steps and tool steps of its worker session: tool name, argument preview, duration, result size, error text. Ends with a reconciliation block: persisted `api_call_count` vs. steps the transcript can explain. |
 | **Usage** | Per-agent and per-model tables: LLM requests with share %, input/output, cache read, tool calls, retries, cost where the provider reports pricing. |
-| **Activity** | Hourly LLM-call buckets parsed from the profile logs (24 h / 72 h / all), as a bar chart plus a table with tokens and average latency per hour. |
+| **Activity** | Donut of LLM requests per agent (share %) and a second one labelled in tokens; hourly call and token line charts over 6 h / 24 h / 72 h / all (hours without a logged call are zero-filled); a cache-read / input / output mix bar; and the hourly table with tokens and average latency. |
 
 The statusbar chip shows total LLM requests and turns red on errors; clicking it
 opens the page. It shares the page's query key, so the two never run the
