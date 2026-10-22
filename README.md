@@ -1,4 +1,4 @@
-# Statistics — a Hermes desktop plugin
+# Statistics (Статистика) — a Hermes desktop plugin
 
 **What is Hermes doing right now, and where does all that work go?**
 

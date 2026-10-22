@@ -1539,12 +1539,14 @@ function StatisticsChip() {
 
 export default {
   id: ID,
-  name: 'Statistics',
-  description: 'Fleet dashboard: agents, LLM requests, tool calls, tasks, execution traces, errors and retries — read from Hermes\' own stores.',
+  name: 'Статистика',
+  description: 'Статистика: агенты, LLM-запросы, tool-вызовы, задачи, трейсы исполнения, ошибки и ретраи — читается из собственных хранилищ Hermes.',
   register(ctx) {
+    // The visible name is the Russian word on purpose: the sidebar row and the
+    // ⌘K entry read «Статистика» whatever locale the app runs in, so one bundle
+    // is enough (an unknown locale falls back to `en`).
     ctx.i18n.register({
-      en: { nav: 'Statistics', open: 'Open Statistics' },
-      ru: { nav: 'Статистика', open: 'Открыть статистику' }
+      en: { nav: 'Статистика', open: 'Открыть статистику' }
     })
 
     const register = () =>
