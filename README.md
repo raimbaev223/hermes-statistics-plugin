@@ -44,7 +44,38 @@ host.request('shell.exec')  ──►  python3 collect.py
 
 The statusbar chip shows total LLM requests and turns red on errors; clicking it
 opens the page. It shares the page's query key, so the two never run the
-collector twice.
+collector twice. <img src="docs/screenshots/chip.png" width="128" alt="statusbar chip" valign="middle">
+
+## Screenshots
+
+Rendered from the plugin's own page component against a live local snapshot —
+the app's real `@hermes/plugin-sdk` components, its Tailwind tokens and the
+default *Nous* skin in dark mode, page area only (1320×900).
+
+**Overview** — eight tiles, top consumers, agents active now, newest errors and
+retries from every profile's log.
+
+![Overview tab](docs/screenshots/overview.png)
+
+**Agents** — every profile with history, list on the left, counters and its
+source / model / session breakdown on the right.
+
+![Agents tab](docs/screenshots/agents.png)
+
+**Tasks** — every kanban board on disk, with the usage of the worker session
+that ran each task.
+
+![Tasks tab](docs/screenshots/tasks.png)
+
+**Usage** — per-agent and per-model tables (share %, tokens, cache reads, tools,
+retries, cost where the provider reports pricing).
+
+![Usage tab](docs/screenshots/usage.png)
+
+**Activity** — donuts for share of requests and tokens, hourly line charts over
+6 h / 24 h / 72 h / all, and the hourly table with tokens and latency.
+
+![Activity tab](docs/screenshots/activity.png)
 
 ## Install
 
@@ -128,8 +159,9 @@ poll — raise it on large installs.
 ## Layout
 
 ```
-plugin.js      the whole UI: page, sidebar row, statusbar chip, ⌘K command
-collect.py     read-only collector: SQLite + logs → one JSON snapshot
+plugin.js               the whole UI: page, sidebar row, statusbar chip, ⌘K command
+collect.py              read-only collector: SQLite + logs → one JSON snapshot
+docs/screenshots/       the images above (the plugin's own tabs, rendered)
 ```
 
 `plugin.js` is plain ESM loaded uncompiled by the app: it imports only
